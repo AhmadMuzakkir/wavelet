@@ -2,10 +2,12 @@ package wavelet
 
 import (
 	"fmt"
+	"math/rand"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/perlin-network/noise/skademlia"
 	"github.com/perlin-network/wavelet/sys"
 	"github.com/stretchr/testify/assert"
 )
@@ -197,6 +199,97 @@ func TestLedger_Sync(t *testing.T) {
 
 DONE:
 	assert.EqualValues(t, alice.Balance(), charlie.BalanceOfAccount(alice))
+}
+
+func TestLedger_Fuzz(t *testing.T) {
+	testnet := NewTestNetwork(t)
+	defer testnet.Cleanup()
+
+	balances := map[[32]byte]uint64{}
+	stakes := map[[32]byte]uint64{}
+	rewards := map[[32]byte]uint64{}
+
+	keys := make([]*skademlia.Keypair, 1000)
+
+	for i := 0; i < len(keys); i++ {
+		keys[i], _ = skademlia.NewKeys(sys.SKademliaC1, sys.SKademliaC2)
+		pubkey := keys[i].PublicKey()
+
+		balances[pubkey] = rand.Uint64()
+		stakes[pubkey] = rand.Uint64()
+		rewards[pubkey] = rand.Uint64()
+	}
+
+	// Setup network with 3 nodes
+	alice := testnet.faucet
+	for i := 0; i < 2; i++ {
+		testnet.AddNode(t)
+	}
+
+	testnet.WaitForConsensus(t)
+
+	// Advance the network by a few rounds larger than sys.SyncIfRoundsDifferBy
+	for i := 0; i < int(sys.SyncIfRoundsDifferBy)+1; i++ {
+		<-alice.WaitForSync()
+		_, err := alice.PlaceStake(1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		<-alice.WaitForConsensus()
+	}
+
+	testnet.WaitForRound(t, alice.RoundIndex())
+	fmt.Println(alice.RoundIndex())
+
+	for _, node := range testnet.Nodes() {
+		snapshot := node.ledger.accounts.Snapshot()
+		for k, v := range balances {
+			WriteAccountBalance(snapshot, k, v)
+		}
+
+		err := node.ledger.accounts.Commit(snapshot)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Overwrite round merkle?
+		// node.ledger.rounds.Latest().Merkle = snapshot.Checksum()
+	}
+
+	// When a new node joins the network, it will eventually
+	// sync with the other nodes
+	fmt.Println("charlie joins")
+	charlie := testnet.AddNode(t)
+
+	timeout := time.NewTimer(time.Second * 30)
+	for {
+		select {
+		case <-timeout.C:
+			t.Fatal("timed out waiting for sync")
+
+		default:
+			ri := <-charlie.WaitForRound(alice.RoundIndex())
+			fmt.Println(ri)
+			if ri >= alice.RoundIndex() {
+				goto DONE
+			}
+		}
+	}
+
+DONE:
+	snapshot := alice.ledger.accounts.Snapshot()
+	for k, expected := range balances {
+		actual, _ := ReadAccountBalance(snapshot, k)
+		assert.EqualValues(t, expected, actual)
+	}
+	for k, expected := range stakes {
+		actual, _ := ReadAccountStake(snapshot, k)
+		assert.EqualValues(t, expected, actual)
+	}
+	for k, expected := range rewards {
+		actual, _ := ReadAccountReward(snapshot, k)
+		assert.EqualValues(t, expected, actual)
+	}
 }
 
 func txError(tx Transaction, err error) error {
