@@ -47,6 +47,10 @@ func (n *TestNetwork) Faucet() *TestLedger {
 	return n.faucet
 }
 
+func (n *TestNetwork) Nodes() []*TestLedger {
+	return n.nodes
+}
+
 func (n *TestNetwork) AddNode(t testing.TB) *TestLedger {
 	node := NewTestLedger(t, TestLedgerConfig{
 		Peers: []string{n.faucet.Addr()},
@@ -236,9 +240,9 @@ func (l *TestLedger) BalanceOfAccount(node *TestLedger) uint64 {
 	return balance
 }
 
-func (l *TestLedger) BalanceOfAddress(address [32]byte) uint64 {
+func (l *TestLedger) BalanceWithPublicKey(key AccountID) uint64 {
 	snapshot := l.ledger.Snapshot()
-	balance, _ := ReadAccountBalance(snapshot, address)
+	balance, _ := ReadAccountBalance(snapshot, key)
 	return balance
 }
 
@@ -270,6 +274,12 @@ func (l *TestLedger) Reward() uint64 {
 	snapshot := l.ledger.Snapshot()
 	reward, _ := ReadAccountReward(snapshot, l.PublicKey())
 	return reward
+}
+
+func (l *TestLedger) RewardWithPublicKey(key AccountID) uint64 {
+	snapshot := l.ledger.Snapshot()
+	balance, _ := ReadAccountReward(snapshot, key)
+	return balance
 }
 
 func (l *TestLedger) RoundIndex() uint64 {

@@ -403,9 +403,9 @@ func (t *Tree) IterateLeafDiff(prevViewID uint64, callback func(key, value []byt
 }
 
 func (t *Tree) ApplyDiffWithUpdateNotifier(diff io.Reader, updateNotifier func(key, value []byte)) error {
-	var root *node
+	var rootID [MerkleHashSize]byte
 	unresolved := make(map[[MerkleHashSize]byte]struct{})
-	preloaded := newNodeDiffHashMap(t.kv, DiffsKeyPrefix, t.viewID)
+	preloaded := newDiffKV(t.kv, DiffsKeyPrefix, t.viewID)
 
 	for {
 		n, err := DeserializeFromDifference(diff, t.viewID)
@@ -420,8 +420,8 @@ func (t *Tree) ApplyDiffWithUpdateNotifier(diff io.Reader, updateNotifier func(k
 			return err
 		}
 
-		if root == nil {
-			root = n
+		if rootID == [MerkleHashSize]byte{} {
+			rootID = n.id
 		} else {
 			if _, ok := unresolved[n.id]; !ok {
 				return errors.Errorf("unexpected node")
@@ -434,13 +434,11 @@ func (t *Tree) ApplyDiffWithUpdateNotifier(diff io.Reader, updateNotifier func(k
 		}
 	}
 
-	if root == nil {
+	if rootID == [MerkleHashSize]byte{} {
 		return nil
 	}
 
-	// TODO: populate diff immediately? Otherwise, if the diff is really big,
-	// preloaded will fill up memory
-	_, err := populateDiffs(t, root.id, preloaded, make(map[[MerkleHashSize]byte]struct{}), updateNotifier)
+	root, err := populateDiffs(t, rootID, preloaded, make(map[[MerkleHashSize]byte]struct{}), updateNotifier)
 	if err != nil {
 		return errors.Wrap(err, "invalid difference")
 	}

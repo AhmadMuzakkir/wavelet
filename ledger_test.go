@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/perlin-network/noise/skademlia"
 	"github.com/perlin-network/wavelet/sys"
 	"github.com/stretchr/testify/assert"
 )
@@ -157,67 +156,34 @@ func TestLedger_SpamContracts(t *testing.T) {
 	assert.True(t, <-alice.WaitForConsensus())
 }
 
+type account struct {
+	PublicKey [32]byte
+	Balance   uint64
+	Stake     uint64
+	Reward    uint64
+}
+
 func TestLedger_Sync(t *testing.T) {
 	testnet := NewTestNetwork(t)
 	defer testnet.Cleanup()
 
-	// Setup network with 3 nodes
-	alice := testnet.faucet
-	for i := 0; i < 2; i++ {
-		testnet.AddNode(t)
-	}
+	rand.Seed(time.Now().UnixNano())
 
-	// Advance the network by a few rounds larger than sys.SyncIfRoundsDifferBy
-	for i := 0; i < int(sys.SyncIfRoundsDifferBy)+1; i++ {
-		<-alice.WaitForSync()
-		_, err := alice.PlaceStake(10)
-		if err != nil {
+	// Generate accounts
+	accounts := make([]account, 10000)
+	for i := 0; i < len(accounts); i++ {
+		// Use random keys to speed up generation
+		var key [32]byte
+		if _, err := rand.Read(key[:]); err != nil {
 			t.Fatal(err)
 		}
-		<-alice.WaitForConsensus()
-	}
 
-	testnet.WaitForRound(t, alice.RoundIndex())
-
-	// When a new node joins the network, it will eventually
-	// sync with the other nodes
-	charlie := testnet.AddNode(t)
-
-	timeout := time.NewTimer(time.Second * 30)
-	for {
-		select {
-		case <-timeout.C:
-			t.Fatal("timed out waiting for sync")
-
-		default:
-			ri := <-charlie.WaitForRound(alice.RoundIndex())
-			if ri >= alice.RoundIndex() {
-				goto DONE
-			}
+		accounts[i] = account{
+			PublicKey: key,
+			Balance:   rand.Uint64(),
+			Stake:     rand.Uint64(),
+			Reward:    rand.Uint64(),
 		}
-	}
-
-DONE:
-	assert.EqualValues(t, alice.Balance(), charlie.BalanceOfAccount(alice))
-}
-
-func TestLedger_Fuzz(t *testing.T) {
-	testnet := NewTestNetwork(t)
-	defer testnet.Cleanup()
-
-	balances := map[[32]byte]uint64{}
-	stakes := map[[32]byte]uint64{}
-	rewards := map[[32]byte]uint64{}
-
-	keys := make([]*skademlia.Keypair, 1000)
-
-	for i := 0; i < len(keys); i++ {
-		keys[i], _ = skademlia.NewKeys(sys.SKademliaC1, sys.SKademliaC2)
-		pubkey := keys[i].PublicKey()
-
-		balances[pubkey] = rand.Uint64()
-		stakes[pubkey] = rand.Uint64()
-		rewards[pubkey] = rand.Uint64()
 	}
 
 	// Setup network with 3 nodes
@@ -225,8 +191,6 @@ func TestLedger_Fuzz(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		testnet.AddNode(t)
 	}
-
-	testnet.WaitForConsensus(t)
 
 	// Advance the network by a few rounds larger than sys.SyncIfRoundsDifferBy
 	for i := 0; i < int(sys.SyncIfRoundsDifferBy)+1; i++ {
@@ -239,29 +203,37 @@ func TestLedger_Fuzz(t *testing.T) {
 	}
 
 	testnet.WaitForRound(t, alice.RoundIndex())
-	fmt.Println(alice.RoundIndex())
 
+	// Use bigger LRU size to avoid writing to disk
+	// to speed up fuzzing
+	lruSize := 20480
+	snapshot := testnet.Nodes()[0].ledger.accounts.Snapshot().WithLRUCache(&lruSize)
+
+	snapshot.SetViewID(alice.RoundIndex() + 1)
+	for _, acc := range accounts {
+		WriteAccountBalance(snapshot, acc.PublicKey, acc.Balance)
+		WriteAccountStake(snapshot, acc.PublicKey, acc.Stake)
+		WriteAccountReward(snapshot, acc.PublicKey, acc.Reward)
+	}
+
+	// Override ledger state of all nodes
 	for _, node := range testnet.Nodes() {
-		snapshot := node.ledger.accounts.Snapshot()
-		for k, v := range balances {
-			WriteAccountBalance(snapshot, k, v)
-		}
-
 		err := node.ledger.accounts.Commit(snapshot)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		// Overwrite round merkle?
-		// node.ledger.rounds.Latest().Merkle = snapshot.Checksum()
+		// Override latest round merkle with the new state snapshot
+		// TODO: this is causing data race
+		round := node.ledger.rounds.Latest()
+		round.Merkle = snapshot.Checksum()
 	}
 
 	// When a new node joins the network, it will eventually
 	// sync with the other nodes
-	fmt.Println("charlie joins")
 	charlie := testnet.AddNode(t)
 
-	timeout := time.NewTimer(time.Second * 30)
+	timeout := time.NewTimer(time.Second * 300)
 	for {
 		select {
 		case <-timeout.C:
@@ -269,7 +241,6 @@ func TestLedger_Fuzz(t *testing.T) {
 
 		default:
 			ri := <-charlie.WaitForRound(alice.RoundIndex())
-			fmt.Println(ri)
 			if ri >= alice.RoundIndex() {
 				goto DONE
 			}
@@ -277,18 +248,10 @@ func TestLedger_Fuzz(t *testing.T) {
 	}
 
 DONE:
-	snapshot := alice.ledger.accounts.Snapshot()
-	for k, expected := range balances {
-		actual, _ := ReadAccountBalance(snapshot, k)
-		assert.EqualValues(t, expected, actual)
-	}
-	for k, expected := range stakes {
-		actual, _ := ReadAccountStake(snapshot, k)
-		assert.EqualValues(t, expected, actual)
-	}
-	for k, expected := range rewards {
-		actual, _ := ReadAccountReward(snapshot, k)
-		assert.EqualValues(t, expected, actual)
+	for _, acc := range accounts {
+		assert.EqualValues(t, acc.Balance, charlie.BalanceWithPublicKey(acc.PublicKey))
+		assert.EqualValues(t, acc.Stake, charlie.StakeWithPublicKey(acc.PublicKey))
+		assert.EqualValues(t, acc.Reward, charlie.RewardWithPublicKey(acc.PublicKey))
 	}
 }
 

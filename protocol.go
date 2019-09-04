@@ -132,13 +132,15 @@ func (p *Protocol) Sync(stream Wavelet_SyncServer) error {
 	go func() {
 		defer close(chunking)
 
-		var chunk [sys.SyncChunkSize]byte
+		var buffer [sys.SyncChunkSize]byte
 		for {
-			n, err := buf.Read(chunk[:])
+			n, err := buf.Read(buffer[:])
 			if n > 0 {
-				checksum := blake2b.Sum256(chunk[:n])
-				p.ledger.chunks.Put(checksum, chunk[:n])
+				chunk := make([]byte, n)
+				copy(chunk, buffer[:n])
 
+				checksum := blake2b.Sum256(chunk)
+				p.ledger.chunks.Put(checksum, chunk)
 				header.Checksums = append(header.Checksums, checksum[:])
 			}
 
