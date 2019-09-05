@@ -640,7 +640,7 @@ func mustDeserialize(r *bytes.Reader) *node {
 }
 
 // populateDiffs constructs a valid AVL tree from the incoming preloaded tree difference.
-func populateDiffs(t *Tree, id [MerkleHashSize]byte, preloaded *diffKV, visited map[[MerkleHashSize]byte]struct{}, updateNotifier func(key, value []byte)) (*node, error) {
+func populateDiffs(t *Tree, id [MerkleHashSize]byte, preloaded *diffQueue, visited map[[MerkleHashSize]byte]struct{}, updateNotifier func(key, value []byte)) (*node, error) {
 	if t.root != nil && !t.root.wroteBack {
 		return nil, errors.New("cannot call populateDiffs() on a dirty tree")
 	}
@@ -650,14 +650,9 @@ func populateDiffs(t *Tree, id [MerkleHashSize]byte, preloaded *diffKV, visited 
 	}
 	visited[id] = struct{}{}
 
-	n, err := preloaded.Get(id)
-	if err != nil {
-		return nil, err
-	}
-
 	// Node is not a preloaded diff
-	if n == nil {
-		n, err = t.loadNode(id)
+	if !preloaded.Has(id) {
+		n, err := t.loadNode(id)
 		if err != nil {
 			return nil, err
 		}
@@ -665,8 +660,17 @@ func populateDiffs(t *Tree, id [MerkleHashSize]byte, preloaded *diffKV, visited 
 		return n, nil
 	}
 
+	n, err := preloaded.Dequeue()
+	if err != nil {
+		return nil, err
+	}
+
 	if n.size != 0 || n.depth != 0 {
 		panic("BUG: Size != 0 || Depth != 0, possible inconsistency")
+	}
+
+	if n.id != id {
+		return nil, errors.New("invalid diff order")
 	}
 
 	if n.kind == NodeLeafValue {

@@ -170,7 +170,7 @@ func TestLedger_Sync(t *testing.T) {
 	rand.Seed(time.Now().UnixNano())
 
 	// Generate accounts
-	accounts := make([]account, 10000)
+	accounts := make([]account, 100000)
 	for i := 0; i < len(accounts); i++ {
 		// Use random keys to speed up generation
 		var key [32]byte
@@ -231,6 +231,8 @@ func TestLedger_Sync(t *testing.T) {
 
 	// When a new node joins the network, it will eventually
 	// sync with the other nodes
+	fmt.Println("charlie joins!")
+	//log.SetWriter(log.ModuleNode, os.Stdout)
 	charlie := testnet.AddNode(t)
 
 	timeout := time.NewTimer(time.Second * 300)

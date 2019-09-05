@@ -32,6 +32,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/djherbis/buffer"
 	"github.com/perlin-network/wavelet/lru"
 
 	"github.com/perlin-network/noise"
@@ -88,9 +89,11 @@ type Ledger struct {
 	syncStatus     bitset
 	syncStatusLock sync.RWMutex
 
-	cacheCollapse *lru.LRU
-	chunks        *chunkHashMap
-	chunksBuffer  *os.File
+	cacheCollapse    *lru.LRU
+	chunks           *chunkHashMap
+	incomingDiff     buffer.BufferAt
+	incomingDiffFile *os.File
+	outgoingDiff     buffer.Buffer
 
 	sendQuota chan struct{}
 
@@ -172,9 +175,9 @@ func NewLedger(kv store.KV, client *skademlia.Client, opts ...Option) *Ledger {
 	finalizer := NewSnowball(WithName("finalizer"), WithBeta(sys.SnowballBeta))
 	syncer := NewSnowball(WithName("syncer"), WithBeta(sys.SnowballBeta))
 
-	chunksBuffer, err := ioutil.TempFile("", "chunks")
+	incoming, err := ioutil.TempFile("", "incoming-diff")
 	if err != nil {
-		logger.Fatal().Err(err).Msg("BUG: COULD NOT CREATE CHUNKS BUFFER ON DISK.")
+		logger.Fatal().Err(err).Msg("BUG: COULD NOT CREATE DIFF BUFFER ON DISK.")
 	}
 
 	ledger := &Ledger{
@@ -196,8 +199,11 @@ func NewLedger(kv store.KV, client *skademlia.Client, opts ...Option) *Ledger {
 		syncVotes: make(chan vote, sys.SnowballK),
 
 		cacheCollapse: lru.NewLRU(16),
-		chunks:        newChunkHashMap(kv, ChunksKeyPrefix).WithLRUCache(1024), // In total, it will take up 1024 * 4MB.
-		chunksBuffer:  chunksBuffer,
+		chunks:        newChunkHashMap(kv, ChunksKeyPrefix),
+
+		incomingDiff:     buffer.NewFile(1024*1024*1024, incoming),
+		incomingDiffFile: incoming,
+		outgoingDiff:     buffer.NewUnboundedBuffer(100*1024*1024, 100*1024*1024),
 
 		sendQuota: make(chan struct{}, 2000),
 	}
@@ -1190,16 +1196,7 @@ func (l *Ledger) SyncToLatestRound() {
 			idx++
 		}
 
-		if err := l.chunksBuffer.Truncate(int64(len(sources)) * sys.SyncChunkSize); err != nil {
-			logger.Error().
-				Uint64("target_round", latest.Index).
-				Err(err).
-				Msg("Failed to truncate chunks buffer. Restarting sync...")
-			goto SYNC
-		}
-
 		// Streams may not concurrently send and receive messages at once.
-
 		streamLocks := make(map[Wavelet_SyncClient]*sync.Mutex)
 		var streamLock sync.Mutex
 
@@ -1215,6 +1212,8 @@ func (l *Ledger) SyncToLatestRound() {
 			Int("num_chunks", len(sources)).
 			Int("num_workers", cap(workers)).
 			Msg("Starting up workers to downloaded all chunks of data needed to sync to the latest round...")
+
+		start := time.Now()
 
 		for i := 0; i < cap(workers); i++ {
 			go func() {
@@ -1263,7 +1262,7 @@ func (l *Ledger) SyncToLatestRound() {
 						}
 
 						// We found the chunk! Store the chunks contents.
-						if _, err := l.chunksBuffer.WriteAt(chunk, int64(src.idx)*sys.SyncChunkSize); err != nil {
+						if _, err := l.incomingDiff.WriteAt(chunk, int64(src.idx)*sys.SyncChunkSize); err != nil {
 							continue
 						}
 
@@ -1314,17 +1313,13 @@ func (l *Ledger) SyncToLatestRound() {
 			Uint64("target_round", latest.Index).
 			Msg("All chunks have been successfully verified and re-assembled into a diff. Applying diff...")
 
+		elapsed := time.Now().Sub(start)
+		fmt.Println("[receiver] downloading diff dump took", elapsed)
+
+		fmt.Printf("[receiver] diff dump is %.2f MB\n", float64(l.incomingDiff.Len())/(1024.0*1024.0))
+
 		snapshot := l.accounts.Snapshot()
-
-		if err := l.chunksBuffer.Truncate(diffSize); err != nil {
-			logger.Error().
-				Uint64("target_round", latest.Index).
-				Err(err).
-				Msg("Failed to truncate re-assembled diff. Restarting sync...")
-			goto SYNC
-		}
-
-		if err := snapshot.ApplyDiff(l.chunksBuffer); err != nil {
+		if err := snapshot.ApplyDiff(l.incomingDiff); err != nil {
 			logger.Error().
 				Uint64("target_round", latest.Index).
 				Err(err).
@@ -1361,10 +1356,15 @@ func (l *Ledger) SyncToLatestRound() {
 
 		l.graph.UpdateRoot(latest.End)
 
+		start = time.Now()
+
 		if err := l.accounts.Commit(snapshot); err != nil {
 			logger := log.Node()
 			logger.Fatal().Err(err).Msg("failed to commit collapsed state to our database")
 		}
+
+		elapsed = time.Now().Sub(start)
+		fmt.Println("[receiver] commiting snapshot took", elapsed)
 
 		logger = log.Sync("apply")
 		logger.Info().

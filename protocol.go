@@ -78,42 +78,6 @@ func (p *Protocol) Query(ctx context.Context, req *QueryRequest) (*QueryResponse
 	return res, nil
 }
 
-// channelBuffer is a buffer which blocks write if the
-// buffer is full.
-type channelBuffer struct {
-	Bytes chan byte
-
-	// If reading blocks longer than ReadTimeout,
-	// io.EOF is returned.
-	ReadTimeout time.Duration
-}
-
-func (b *channelBuffer) Read(buf []byte) (int, error) {
-	n := 0
-	for n < len(buf) {
-		select {
-		case bb := <-b.Bytes:
-			buf[n] = bb
-			n++
-
-		case <-time.After(b.ReadTimeout):
-			return n, io.EOF
-		}
-	}
-
-	return n, nil
-}
-
-func (b *channelBuffer) Write(buf []byte) (int, error) {
-	for _, bb := range buf {
-		// Write will block indefinitely, basically slowing
-		// down diff dumping if read is too fast
-		b.Bytes <- bb
-	}
-
-	return len(buf), nil
-}
-
 func (p *Protocol) Sync(stream Wavelet_SyncServer) error {
 	req, err := stream.Recv()
 	if err != nil {
@@ -123,39 +87,45 @@ func (p *Protocol) Sync(stream Wavelet_SyncServer) error {
 	res := &SyncResponse{}
 	header := &SyncInfo{LatestRound: p.ledger.rounds.Latest().Marshal()}
 
-	// The diffs are dumped into an in-memory buffer, while at the same time,
-	// it is chunked as fast as possible. This avoids needing to write the chunks
-	// into memory, as that is being handled by cacheChunks.
-	buf := &channelBuffer{Bytes: make(chan byte, 1024), ReadTimeout: time.Millisecond * 100}
+	p.ledger.outgoingDiff.Reset()
 
-	chunking := make(chan struct{})
-	go func() {
-		defer close(chunking)
+	start := time.Now()
 
-		var buffer [sys.SyncChunkSize]byte
-		for {
-			n, err := buf.Read(buffer[:])
-			if n > 0 {
-				chunk := make([]byte, n)
-				copy(chunk, buffer[:n])
-
-				checksum := blake2b.Sum256(chunk)
-				p.ledger.chunks.Put(checksum, chunk)
-				header.Checksums = append(header.Checksums, checksum[:])
-			}
-
-			if err == io.EOF {
-				return
-			}
-		}
-	}()
-
-	if err := p.ledger.accounts.Snapshot().DumpDiff(req.GetRoundId(), buf); err != nil {
+	if err := p.ledger.accounts.Snapshot().DumpDiff(req.GetRoundId(), p.ledger.outgoingDiff); err != nil {
 		return err
 	}
 
-	// Wait for chunking to finish
-	<-chunking
+	elapsed := time.Now().Sub(start)
+	fmt.Println("[sender] dumping diff took", elapsed)
+
+	start = time.Now()
+
+	// Chunk dumped diff
+	var chunkBuf [sys.SyncChunkSize]byte
+	var diffSize int
+	for {
+		n, err := p.ledger.outgoingDiff.Read(chunkBuf[:])
+		if n > 0 {
+			chunk := make([]byte, n)
+			copy(chunk, chunkBuf[:n])
+
+			checksum := blake2b.Sum256(chunk)
+			p.ledger.chunks.Put(checksum, chunk)
+			header.Checksums = append(header.Checksums, checksum[:])
+			diffSize += len(chunk)
+		}
+
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			return err
+		}
+	}
+
+	elapsed = time.Now().Sub(start)
+	fmt.Println("[sender] chunks:", len(header.Checksums))
+	fmt.Println("[sender] chunking diff took", elapsed)
+	fmt.Printf("[sender] diff dump is %.2f MB\n", float64(diffSize)/(1024.0*1024.0))
 
 	res.Data = &SyncResponse_Header{Header: header}
 

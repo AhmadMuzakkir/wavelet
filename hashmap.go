@@ -6,7 +6,6 @@ import (
 	"golang.org/x/crypto/blake2b"
 )
 
-// TODO: need a better name
 type chunkHashMap struct {
 	prefix []byte
 	kv     store.KV
@@ -18,14 +17,9 @@ func newChunkHashMap(kv store.KV, prefix []byte) *chunkHashMap {
 	return &chunkHashMap{
 		prefix: prefix,
 		kv:     kv,
-		cache:  lru.NewLRU(1024),
+		cache:  lru.NewLRU(512), // 512 * 64kb = 32MB
 		keys:   make(map[[blake2b.Size256]byte]struct{}),
 	}
-}
-
-func (h *chunkHashMap) WithLRUCache(size int) *chunkHashMap {
-	h.cache = lru.NewLRU(size)
-	return h
 }
 
 func (h *chunkHashMap) Get(checksum [blake2b.Size256]byte) ([]byte, error) {
@@ -44,16 +38,26 @@ func (h *chunkHashMap) Get(checksum [blake2b.Size256]byte) ([]byte, error) {
 		return nil, err
 	}
 
-	h.cache.Put(checksum, chunk)
+	h.cache.PutWithEvictCallback(checksum, chunk, func(key, value interface{}) {
+		evictedKey := key.([blake2b.Size256]byte)
+		evictedValue := value.([]byte)
+
+		err = h.kv.Put(append(h.prefix, evictedKey[:]...), evictedValue)
+	})
+	if err != nil {
+		return nil, err
+	}
+
 	return chunk, nil
 }
 
 func (h *chunkHashMap) Put(checksum [blake2b.Size256]byte, chunk []byte) error {
 	var err error
-	h.cache.PutWithEvictCallback(checksum, chunk, func(key interface{}, val interface{}) {
+	h.cache.PutWithEvictCallback(checksum, chunk, func(key, value interface{}) {
 		evictedKey := key.([blake2b.Size256]byte)
-		evicted := val.([]byte)
-		err = h.kv.Put(append(h.prefix, evictedKey[:]...), evicted)
+		evictedValue := value.([]byte)
+
+		err = h.kv.Put(append(h.prefix, evictedKey[:]...), evictedValue)
 	})
 
 	if err != nil {

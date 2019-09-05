@@ -41,7 +41,7 @@ const (
 
 const (
 	// Size of individual chunks sent for a syncing peer.
-	SyncChunkSize = 16384
+	SyncChunkSize = 65536
 )
 
 var (
