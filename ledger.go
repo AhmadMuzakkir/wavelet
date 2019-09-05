@@ -25,9 +25,8 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math/rand"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -89,11 +88,9 @@ type Ledger struct {
 	syncStatus     bitset
 	syncStatusLock sync.RWMutex
 
-	cacheCollapse    *lru.LRU
-	chunks           *chunkHashMap
-	incomingDiff     buffer.BufferAt
-	incomingDiffFile *os.File
-	outgoingDiff     buffer.Buffer
+	cacheCollapse *lru.LRU
+	chunks        *chunkHashMap
+	filePool      buffer.Pool
 
 	sendQuota chan struct{}
 
@@ -175,10 +172,7 @@ func NewLedger(kv store.KV, client *skademlia.Client, opts ...Option) *Ledger {
 	finalizer := NewSnowball(WithName("finalizer"), WithBeta(sys.SnowballBeta))
 	syncer := NewSnowball(WithName("syncer"), WithBeta(sys.SnowballBeta))
 
-	incoming, err := ioutil.TempFile("", "incoming-diff")
-	if err != nil {
-		logger.Fatal().Err(err).Msg("BUG: COULD NOT CREATE DIFF BUFFER ON DISK.")
-	}
+	filePool := buffer.NewFilePool(sys.SyncPooledFileSize, "")
 
 	ledger := &Ledger{
 		client:  client,
@@ -200,10 +194,7 @@ func NewLedger(kv store.KV, client *skademlia.Client, opts ...Option) *Ledger {
 
 		cacheCollapse: lru.NewLRU(16),
 		chunks:        newChunkHashMap(kv, ChunksKeyPrefix),
-
-		incomingDiff:     buffer.NewFile(1024*1024*1024, incoming),
-		incomingDiffFile: incoming,
-		outgoingDiff:     buffer.NewUnboundedBuffer(100*1024*1024, 100*1024*1024),
+		filePool:      filePool,
 
 		sendQuota: make(chan struct{}, 2000),
 	}
@@ -1213,6 +1204,44 @@ func (l *Ledger) SyncToLatestRound() {
 			Int("num_workers", cap(workers)).
 			Msg("Starting up workers to downloaded all chunks of data needed to sync to the latest round...")
 
+		maxDiffSize := len(sources) * sys.SyncChunkSize
+		filesCount := maxDiffSize / sys.SyncPooledFileSize
+		if maxDiffSize%sys.SyncPooledFileSize > 0 {
+			filesCount++
+		}
+
+		diffBuffer := buffer.NewMulti(
+			buffer.New(sys.SyncMaxChunkMemory),
+			buffer.NewPartition(l.filePool))
+
+		chunkFiles := make([]buffer.BufferAt, filesCount)
+		cleanup := func() {
+			for i := 0; i < len(chunkFiles); i++ {
+				if chunkFiles[i] != nil {
+					l.filePool.Put(chunkFiles[i])
+				}
+				chunkFiles[i] = nil
+			}
+
+			diffBuffer.Reset()
+		}
+
+		for i := 0; i < filesCount; i++ {
+			file, err := l.filePool.Get()
+			if err != nil {
+				logger.Error().
+					Msg("Could not open file for writing chunks")
+
+				cleanup()
+				goto SYNC
+			}
+
+			chunkFiles[i] = file.(buffer.BufferAt)
+		}
+
+		// Downloaded chunks are written directly to disk first.
+		chunksBuffer := buffer.NewMultiAt(chunkFiles...)
+
 		start := time.Now()
 
 		for i := 0; i < cap(workers); i++ {
@@ -1262,7 +1291,7 @@ func (l *Ledger) SyncToLatestRound() {
 						}
 
 						// We found the chunk! Store the chunks contents.
-						if _, err := l.incomingDiff.WriteAt(chunk, int64(src.idx)*sys.SyncChunkSize); err != nil {
+						if _, err := chunksBuffer.WriteAt(chunk, int64(src.idx)*sys.SyncChunkSize); err != nil {
 							continue
 						}
 
@@ -1294,7 +1323,6 @@ func (l *Ledger) SyncToLatestRound() {
 		dispose() // Shutdown all streams as we no longer need them.
 
 		// Check all chunks has been received
-		var diffSize int64
 		for i, src := range sources {
 			if src.size == 0 {
 				logger.Error().
@@ -1302,10 +1330,23 @@ func (l *Ledger) SyncToLatestRound() {
 					Hex("chunk_checksum", sources[i].checksum[:]).
 					Msg("Could not download one of the chunks necessary to sync to the latest round! Retrying...")
 
+				cleanup()
 				goto SYNC
 			}
+		}
+		elapsed := time.Now().Sub(start)
+		fmt.Println("[receiver] downloading diff dump took", elapsed)
+		fmt.Printf("[receiver] diff dump is %.2f MB\n", float64(chunksBuffer.Len())/(1024.0*1024.0))
 
-			diffSize += int64(src.size)
+		// Copy assembled chunks from disk into a bounded buffer
+		if _, err := io.Copy(diffBuffer, chunksBuffer); err != nil {
+			logger.Error().
+				Uint64("target_round", latest.Index).
+				Err(err).
+				Msg("Failed to write chunks to bounded memory buffer. Restarting sync...")
+
+			cleanup()
+			goto SYNC
 		}
 
 		logger.Info().
@@ -1313,17 +1354,14 @@ func (l *Ledger) SyncToLatestRound() {
 			Uint64("target_round", latest.Index).
 			Msg("All chunks have been successfully verified and re-assembled into a diff. Applying diff...")
 
-		elapsed := time.Now().Sub(start)
-		fmt.Println("[receiver] downloading diff dump took", elapsed)
-
-		fmt.Printf("[receiver] diff dump is %.2f MB\n", float64(l.incomingDiff.Len())/(1024.0*1024.0))
-
 		snapshot := l.accounts.Snapshot()
-		if err := snapshot.ApplyDiff(l.incomingDiff); err != nil {
+		if err := snapshot.ApplyDiff(diffBuffer); err != nil {
 			logger.Error().
 				Uint64("target_round", latest.Index).
 				Err(err).
 				Msg("Failed to apply re-assembled diff to our ledger state. Restarting sync...")
+
+			cleanup()
 			goto SYNC
 		}
 
@@ -1334,12 +1372,14 @@ func (l *Ledger) SyncToLatestRound() {
 				Hex("yielded_merkle_root", checksum[:]).
 				Msg("Failed to apply re-assembled diff to our ledger state. Restarting sync...")
 
+			cleanup()
 			goto SYNC
 		}
 
 		pruned, err := l.rounds.Save(latest)
 		if err != nil {
 			fmt.Printf("Failed to save finalized round to our database: %v\n", err)
+			cleanup()
 			goto SYNC
 		}
 
@@ -1359,6 +1399,7 @@ func (l *Ledger) SyncToLatestRound() {
 		start = time.Now()
 
 		if err := l.accounts.Commit(snapshot); err != nil {
+			cleanup()
 			logger := log.Node()
 			logger.Fatal().Err(err).Msg("failed to commit collapsed state to our database")
 		}
@@ -1379,6 +1420,7 @@ func (l *Ledger) SyncToLatestRound() {
 			Hex("old_merkle_root", current.Merkle[:]).
 			Msg("Successfully built a new state Snapshot out of chunk(s) we have received from peers.")
 
+		cleanup()
 		restart()
 	}
 }

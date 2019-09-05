@@ -41,7 +41,13 @@ const (
 
 const (
 	// Size of individual chunks sent for a syncing peer.
-	SyncChunkSize = 65536
+	SyncChunkSize = 64 * 1024 // 64KB
+
+	// Max size of chunks to be stored on memory
+	SyncMaxChunkMemory = 100 * 1024 * 1024 // 100MB
+
+	// Size of file size used for streaming file to disk during syncing.
+	SyncPooledFileSize = 100 * 1024 * 1024 // 100MB
 )
 
 var (

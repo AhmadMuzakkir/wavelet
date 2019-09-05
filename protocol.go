@@ -26,6 +26,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/djherbis/buffer"
 	"github.com/perlin-network/wavelet/log"
 	"github.com/perlin-network/wavelet/sys"
 	"github.com/pkg/errors"
@@ -87,11 +88,11 @@ func (p *Protocol) Sync(stream Wavelet_SyncServer) error {
 	res := &SyncResponse{}
 	header := &SyncInfo{LatestRound: p.ledger.rounds.Latest().Marshal()}
 
-	p.ledger.outgoingDiff.Reset()
+	diffBuffer := buffer.NewMulti(buffer.New(sys.SyncMaxChunkMemory), buffer.NewPartition(p.ledger.filePool))
 
 	start := time.Now()
 
-	if err := p.ledger.accounts.Snapshot().DumpDiff(req.GetRoundId(), p.ledger.outgoingDiff); err != nil {
+	if err := p.ledger.accounts.Snapshot().DumpDiff(req.GetRoundId(), diffBuffer); err != nil {
 		return err
 	}
 
@@ -104,7 +105,7 @@ func (p *Protocol) Sync(stream Wavelet_SyncServer) error {
 	var chunkBuf [sys.SyncChunkSize]byte
 	var diffSize int
 	for {
-		n, err := p.ledger.outgoingDiff.Read(chunkBuf[:])
+		n, err := diffBuffer.Read(chunkBuf[:])
 		if n > 0 {
 			chunk := make([]byte, n)
 			copy(chunk, chunkBuf[:n])
